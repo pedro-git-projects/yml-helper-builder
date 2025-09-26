@@ -14,6 +14,7 @@ import (
 
 const (
 	includeSelector = `{{- include "auki.selectorLabelsFor" (dict "ctx" $ctx "base" $base) | nindent %d }}`
+	includeMeta     = `{{- include "auki.metaLabelsFor"      (dict "ctx" $ctx "base" $base) | nindent %d }}`
 	headerBlockTmpl = `{{- $base := "%s" -}}
 {{- $ctx := . -}}
 {{- $name := include "auki.nameFor" (dict "ctx" $ctx "base" $base) -}}
@@ -93,7 +94,6 @@ func processFile(path string) error {
 	// Regex helpers
 	reKey := regexp.MustCompile(`^(\s*)([A-Za-z0-9_.-]+):(?:\s*(.*))?$`)
 	reKind := regexp.MustCompile(`^\s*kind:\s*([A-Za-z0-9]+)\s*$`)
-	reNameKV := regexp.MustCompile(`^\s*name:\s*(.+?)\s*$`)
 	reDashName := regexp.MustCompile(`^(\s*)-\s*name:\s*(.+?)\s*$`)
 
 	// Skip state: when we rewrite labels/matchLabels, ignore old map entries
@@ -136,29 +136,15 @@ func processFile(path string) error {
 			// ---- Rewrites that MUST happen on the key line itself ----
 
 			// 1) Top-level metadata.name -> {{ $name }}
-			if kind == "Deployment" && p == "metadata" {
-				// If this is the child key "name"
-				if reNameKV.MatchString(strings.TrimLeft(line, " ")) && indent == stack[len(stack)-1].indent {
-					// NOP – this branch is too coarse. Handle by explicit check below.
-				}
-			}
-
-			// 1a) Replace the actual 'name:' under top-level metadata (exact indent math)
-			if kind == "Deployment" && p == "metadata" && reNameKV.MatchString(strings.TrimLeft(line, " ")) && indent == stack[len(stack)-1].indent {
-				// This condition is a bit clunky; do a simpler targeted check instead:
-				// If the previous keyCtx is exactly metadata and this key is 'name'
-			}
-			// Better: detect "metadata.name" explicitly
 			if kind == "Deployment" && p == "metadata.name" {
 				buf.WriteString(spaces(indent) + "name: {{ $name }}\n")
 				continue
 			}
 
-			// 2) metadata.labels (scalar or map) -> normalize and inject include
+			// 2) metadata.labels (scalar or map) -> normalize and inject META labels
 			if kind == "Deployment" && p == "metadata.labels" {
-				// Rewrite labels: <anything> -> labels:\n <include>
 				buf.WriteString(spaces(indent) + "labels:\n")
-				buf.WriteString(fmt.Sprintf(includeSelector, indent+2))
+				buf.WriteString(fmt.Sprintf(includeMeta, indent+2))
 				buf.WriteString("\n")
 				// Skip any original block contents indented under this key
 				skipActive = true
@@ -166,7 +152,7 @@ func processFile(path string) error {
 				continue
 			}
 
-			// 3) spec.template.metadata.labels -> normalize and inject include
+			// 3) spec.template.metadata.labels -> normalize and inject SELECTOR labels
 			if kind == "Deployment" && p == "spec.template.metadata.labels" {
 				buf.WriteString(spaces(indent) + "labels:\n")
 				buf.WriteString(fmt.Sprintf(includeSelector, indent+2))
@@ -176,7 +162,7 @@ func processFile(path string) error {
 				continue
 			}
 
-			// 4) spec.selector.matchLabels -> normalize and inject include
+			// 4) spec.selector.matchLabels -> normalize and inject SELECTOR labels
 			if kind == "Deployment" && p == "spec.selector.matchLabels" {
 				buf.WriteString(spaces(indent) + "matchLabels:\n")
 				buf.WriteString(fmt.Sprintf(includeSelector, indent+2))
@@ -188,7 +174,7 @@ func processFile(path string) error {
 
 			// 5) containers: first item name -> {{ $base }}
 			if kind == "Deployment" && p == "spec.template.spec.containers" && val == "" {
-				// We don't write the list header differently; rewrite happens on list item lines below.
+				// rewrite happens on list item lines below
 			}
 		}
 
@@ -196,7 +182,7 @@ func processFile(path string) error {
 		if kind == "Deployment" {
 			if m := reDashName.FindStringSubmatch(line); m != nil {
 				indent := m[1]
-				// Heuristic: only rewrite when we're under ...spec.template.spec.containers
+				// Only rewrite when we're under ...spec.template.spec.containers
 				if strings.Contains(pathOf(stack), "spec.template.spec.containers") {
 					buf.WriteString(fmt.Sprintf("%s- name: {{ $base }}\n", indent))
 					continue
