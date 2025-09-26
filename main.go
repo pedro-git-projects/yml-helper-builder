@@ -67,7 +67,6 @@ func processFile(path string) error {
 	}
 	content := string(orig)
 
-	// If already migrated (header present), still run replacements safely.
 	hasHeader := strings.Contains(content, `include "auki.nameFor"`)
 
 	base, err := detectBaseFromTopMetadataName(content)
@@ -80,13 +79,12 @@ func processFile(path string) error {
 
 	lines := splitKeepNL(content)
 
-	kind := "" // current K8s kind
+	kind := ""
 	var stack []keyCtx
 
 	var buf bytes.Buffer
 	sc := newScanner(lines)
 
-	// Write header once at the very top if missing
 	if !hasHeader {
 		buf.WriteString(fmt.Sprintf(headerBlockTmpl, base))
 	}
@@ -95,22 +93,26 @@ func processFile(path string) error {
 	reKey := regexp.MustCompile(`^(\s*)([A-Za-z0-9_.-]+):(?:\s*(.*))?$`)
 	reKind := regexp.MustCompile(`^\s*kind:\s*([A-Za-z0-9]+)\s*$`)
 	reDashName := regexp.MustCompile(`^(\s*)-\s*name:\s*(.+?)\s*$`)
+	reNameKV := regexp.MustCompile(`^\s*name:\s*.+?$`)
 
-	// Skip state: when we rewrite labels/matchLabels, ignore old map entries
+	// Skip state for replacing blocks in place
 	skipActive := false
 	skipIndent := -1
+
+	// Track when we are inside the top-level metadata block of the Deployment
+	inTopMeta := false
+	topMetaIndent := -1
 
 	for sc.Scan() {
 		line := sc.Text()
 
-		// If we're skipping the old labels/matchLabels block, ignore lines indented under it
+		// Handle skipping old map contents under labels/matchLabels
 		if skipActive {
 			if countIndent(line) > skipIndent {
-				continue // still inside the old block
+				continue
 			}
-			// block ended
 			skipActive = false
-			// fall through to process this line normally
+			// fallthrough to process this boundary line
 		}
 
 		// Track kind across docs
@@ -118,41 +120,47 @@ func processFile(path string) error {
 			kind = m[1]
 		}
 
-		// Update path stack on key lines
+		// If we left the metadata block by dedent, clear flag
+		if inTopMeta && countIndent(line) <= topMetaIndent {
+			inTopMeta = false
+		}
+
 		if m := reKey.FindStringSubmatch(line); m != nil {
 			indent := len(m[1])
 			key := m[2]
 			val := m[3]
 
-			// shrink to parent
+			// maintain path stack
 			for len(stack) > 0 && indent <= stack[len(stack)-1].indent {
 				stack = stack[:len(stack)-1]
 			}
 			stack = append(stack, keyCtx{indent: indent, key: key})
 
-			// Current dot path "a.b.c"
 			p := pathOf(stack)
 
-			// ---- Rewrites that MUST happen on the key line itself ----
+			// Enter top-level metadata block
+			if kind == "Deployment" && p == "metadata" && val == "" {
+				inTopMeta = true
+				topMetaIndent = indent
+			}
 
-			// 1) Top-level metadata.name -> {{ $name }}
-			if kind == "Deployment" && p == "metadata.name" {
+			// 1) Force metadata.name -> {{ $name }}
+			if kind == "Deployment" && inTopMeta && key == "name" && reNameKV.MatchString(strings.TrimLeft(line, " ")) && indent == topMetaIndent+2 {
 				buf.WriteString(spaces(indent) + "name: {{ $name }}\n")
 				continue
 			}
 
-			// 2) metadata.labels (scalar or map) -> normalize and inject META labels
+			// 2) metadata.labels -> use meta labels include
 			if kind == "Deployment" && p == "metadata.labels" {
 				buf.WriteString(spaces(indent) + "labels:\n")
 				buf.WriteString(fmt.Sprintf(includeMeta, indent+2))
 				buf.WriteString("\n")
-				// Skip any original block contents indented under this key
 				skipActive = true
 				skipIndent = indent
 				continue
 			}
 
-			// 3) spec.template.metadata.labels -> normalize and inject SELECTOR labels
+			// 3) spec.template.metadata.labels -> selector labels include
 			if kind == "Deployment" && p == "spec.template.metadata.labels" {
 				buf.WriteString(spaces(indent) + "labels:\n")
 				buf.WriteString(fmt.Sprintf(includeSelector, indent+2))
@@ -162,7 +170,7 @@ func processFile(path string) error {
 				continue
 			}
 
-			// 4) spec.selector.matchLabels -> normalize and inject SELECTOR labels
+			// 4) spec.selector.matchLabels -> selector labels include
 			if kind == "Deployment" && p == "spec.selector.matchLabels" {
 				buf.WriteString(spaces(indent) + "matchLabels:\n")
 				buf.WriteString(fmt.Sprintf(includeSelector, indent+2))
@@ -171,26 +179,20 @@ func processFile(path string) error {
 				skipIndent = indent
 				continue
 			}
-
-			// 5) containers: first item name -> {{ $base }}
-			if kind == "Deployment" && p == "spec.template.spec.containers" && val == "" {
-				// rewrite happens on list item lines below
-			}
 		}
 
-		// Replace container list item " - name: ..." anywhere under containers
+		// 5) containers: first list item name -> {{ $base }}
 		if kind == "Deployment" {
 			if m := reDashName.FindStringSubmatch(line); m != nil {
-				indent := m[1]
-				// Only rewrite when we're under ...spec.template.spec.containers
+				indentStr := m[1]
 				if strings.Contains(pathOf(stack), "spec.template.spec.containers") {
-					buf.WriteString(fmt.Sprintf("%s- name: {{ $base }}\n", indent))
+					buf.WriteString(fmt.Sprintf("%s- name: {{ $base }}\n", indentStr))
 					continue
 				}
 			}
 		}
 
-		// Default: copy original line
+		// default: copy
 		buf.WriteString(line)
 	}
 
@@ -211,7 +213,7 @@ func processFile(path string) error {
 		}
 	}
 
-	// Write back (with .bak)
+	// Write back with .bak
 	backup := path + ".bak"
 	if err := os.WriteFile(backup, orig, 0644); err != nil {
 		return fmt.Errorf("write backup: %w", err)
