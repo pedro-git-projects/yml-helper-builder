@@ -79,125 +79,132 @@ func processFile(path string) error {
 
 	lines := splitKeepNL(content)
 
-	kind := "" // track current document kind
+	kind := "" // current K8s kind
 	var stack []keyCtx
 
 	var buf bytes.Buffer
 	sc := newScanner(lines)
 
-	insertedHeader := false
+	// Write header once at the very top if missing
 	if !hasHeader {
-		buf.WriteString(fmt.Sprintf(headerBlockTmpl, base)) // insert header at top
-		insertedHeader = true
+		buf.WriteString(fmt.Sprintf(headerBlockTmpl, base))
 	}
 
-	// Patterns
+	// Regex helpers
 	reKey := regexp.MustCompile(`^(\s*)([A-Za-z0-9_.-]+):(?:\s*(.*))?$`)
 	reKind := regexp.MustCompile(`^\s*kind:\s*([A-Za-z0-9]+)\s*$`)
 	reNameKV := regexp.MustCompile(`^\s*name:\s*(.+?)\s*$`)
 	reDashName := regexp.MustCompile(`^(\s*)-\s*name:\s*(.+?)\s*$`)
-	reIncludeSelector := regexp.MustCompile(`include +"auki\.selectorLabelsFor"`)
 
-	type blockState int
-	const (
-		none blockState = iota
-		inTopMetadata
-		inTopLabels
-		inTemplateMetadata
-		inTemplateLabels
-		inContainersList
-	)
-
-	state := none
-	topMetaIndent := -1
-	labelsIndent := -1
-	tplLabelsIndent := -1
+	// Skip state: when we rewrite labels/matchLabels, ignore old map entries
+	skipActive := false
+	skipIndent := -1
 
 	for sc.Scan() {
 		line := sc.Text()
+
+		// If we're skipping the old labels/matchLabels block, ignore lines indented under it
+		if skipActive {
+			if countIndent(line) > skipIndent {
+				continue // still inside the old block
+			}
+			// block ended
+			skipActive = false
+			// fall through to process this line normally
+		}
 
 		// Track kind across docs
 		if m := reKind.FindStringSubmatch(line); m != nil {
 			kind = m[1]
 		}
 
-		// Update indent/key stack
+		// Update path stack on key lines
 		if m := reKey.FindStringSubmatch(line); m != nil {
 			indent := len(m[1])
 			key := m[2]
 			val := m[3]
 
+			// shrink to parent
 			for len(stack) > 0 && indent <= stack[len(stack)-1].indent {
 				stack = stack[:len(stack)-1]
 			}
 			stack = append(stack, keyCtx{indent: indent, key: key})
 
+			// Current dot path "a.b.c"
 			p := pathOf(stack)
 
-			// state transitions (only for Deployment)
-			if kind == "Deployment" {
-				switch {
-				case p == "metadata" && val == "":
-					state = inTopMetadata
-					topMetaIndent = indent
-				case state == inTopMetadata && key == "labels" && val == "":
-					state = inTopLabels
-					labelsIndent = indent
-				case p == "spec.template.metadata" && val == "":
-					state = inTemplateMetadata
-				case state == inTemplateMetadata && key == "labels" && val == "":
-					state = inTemplateLabels
-					tplLabelsIndent = indent
-				case p == "spec.template.spec.containers" && val == "":
-					state = inContainersList
+			// ---- Rewrites that MUST happen on the key line itself ----
+
+			// 1) Top-level metadata.name -> {{ $name }}
+			if kind == "Deployment" && p == "metadata" {
+				// If this is the child key "name"
+				if reNameKV.MatchString(strings.TrimLeft(line, " ")) && indent == stack[len(stack)-1].indent {
+					// NOP – this branch is too coarse. Handle by explicit check below.
 				}
 			}
-		} else {
-			// Handle closing of blocks by indent decrease
-			curIndent := countIndent(line)
-			switch state {
-			case inTopLabels:
-				if curIndent <= labelsIndent {
-					buf = ensureSelectorInclude(buf, labelsIndent+2, reIncludeSelector)
-					state = inTopMetadata
-				}
-			case inTemplateLabels:
-				if curIndent <= tplLabelsIndent {
-					buf = ensureSelectorInclude(buf, tplLabelsIndent+2, reIncludeSelector)
-					state = inTemplateMetadata
-				}
+
+			// 1a) Replace the actual 'name:' under top-level metadata (exact indent math)
+			if kind == "Deployment" && p == "metadata" && reNameKV.MatchString(strings.TrimLeft(line, " ")) && indent == stack[len(stack)-1].indent {
+				// This condition is a bit clunky; do a simpler targeted check instead:
+				// If the previous keyCtx is exactly metadata and this key is 'name'
 			}
-			for len(stack) > 0 && curIndent <= stack[len(stack)-1].indent {
-				stack = stack[:len(stack)-1]
+			// Better: detect "metadata.name" explicitly
+			if kind == "Deployment" && p == "metadata.name" {
+				buf.WriteString(spaces(indent) + "name: {{ $name }}\n")
+				continue
+			}
+
+			// 2) metadata.labels (scalar or map) -> normalize and inject include
+			if kind == "Deployment" && p == "metadata.labels" {
+				// Rewrite labels: <anything> -> labels:\n <include>
+				buf.WriteString(spaces(indent) + "labels:\n")
+				buf.WriteString(fmt.Sprintf(includeSelector, indent+2))
+				buf.WriteString("\n")
+				// Skip any original block contents indented under this key
+				skipActive = true
+				skipIndent = indent
+				continue
+			}
+
+			// 3) spec.template.metadata.labels -> normalize and inject include
+			if kind == "Deployment" && p == "spec.template.metadata.labels" {
+				buf.WriteString(spaces(indent) + "labels:\n")
+				buf.WriteString(fmt.Sprintf(includeSelector, indent+2))
+				buf.WriteString("\n")
+				skipActive = true
+				skipIndent = indent
+				continue
+			}
+
+			// 4) spec.selector.matchLabels -> normalize and inject include
+			if kind == "Deployment" && p == "spec.selector.matchLabels" {
+				buf.WriteString(spaces(indent) + "matchLabels:\n")
+				buf.WriteString(fmt.Sprintf(includeSelector, indent+2))
+				buf.WriteString("\n")
+				skipActive = true
+				skipIndent = indent
+				continue
+			}
+
+			// 5) containers: first item name -> {{ $base }}
+			if kind == "Deployment" && p == "spec.template.spec.containers" && val == "" {
+				// We don't write the list header differently; rewrite happens on list item lines below.
 			}
 		}
 
-		// Rewrites
-		switch {
-		// metadata.name -> {{ $name }}
-		case kind == "Deployment" && state == inTopMetadata &&
-			reNameKV.MatchString(strings.TrimLeft(line, " ")) &&
-			leadingSpaces(line) == topMetaIndent+2:
-			buf.WriteString(spaces(topMetaIndent+2) + "name: {{ $name }}\n")
-			continue
-
-		// metadata.labels: drop app: ...
-		case kind == "Deployment" && state == inTopLabels && isAppLabelLine(line, labelsIndent+2):
-			continue
-
-		// spec.template.metadata.labels: drop app: ...
-		case kind == "Deployment" && state == inTemplateLabels && isAppLabelLine(line, tplLabelsIndent+2):
-			continue
-
-		// containers: first item name -> {{ $base }}
-		case kind == "Deployment" && state == inContainersList && reDashName.MatchString(line):
-			m := reDashName.FindStringSubmatch(line)
-			indent := m[1]
-			buf.WriteString(fmt.Sprintf("%s- name: {{ $base }}\n", indent))
-			continue
+		// Replace container list item " - name: ..." anywhere under containers
+		if kind == "Deployment" {
+			if m := reDashName.FindStringSubmatch(line); m != nil {
+				indent := m[1]
+				// Heuristic: only rewrite when we're under ...spec.template.spec.containers
+				if strings.Contains(pathOf(stack), "spec.template.spec.containers") {
+					buf.WriteString(fmt.Sprintf("%s- name: {{ $base }}\n", indent))
+					continue
+				}
+			}
 		}
 
-		// default: copy original line
+		// Default: copy original line
 		buf.WriteString(line)
 	}
 
@@ -205,18 +212,10 @@ func processFile(path string) error {
 		return err
 	}
 
-	// If file ended inside a labels block, inject include.
-	if state == inTopLabels {
-		buf = ensureSelectorInclude(buf, labelsIndent+2, regexp.MustCompile(`include +"auki\.selectorLabelsFor"`))
-	}
-	if state == inTemplateLabels {
-		buf = ensureSelectorInclude(buf, tplLabelsIndent+2, regexp.MustCompile(`include +"auki\.selectorLabelsFor"`))
-	}
-
 	out := buf.String()
 
 	// Avoid double header if somehow present twice
-	if insertedHeader && strings.Count(out, `include "auki.nameFor"`) > 1 {
+	if !hasHeader && strings.Count(out, `include "auki.nameFor"`) > 1 {
 		parts := strings.SplitN(out, `{{- $name := include "auki.nameFor" (dict "ctx" $ctx "base" $base) -}}`, 2)
 		if len(parts) == 2 {
 			after := strings.SplitN(parts[1], "\n", 2)
